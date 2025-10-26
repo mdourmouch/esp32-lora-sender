@@ -1,7 +1,12 @@
 #include <LoRa.h>
 #include <SPI.h>
 
-// Pin definitions (use constexpr instead of macros)
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_sleep.h"
+#include "esp_wifi.h"
+
+// Pin definitions
 constexpr uint8_t PIN_SS = 5;     // SX1276 NSS (CS)
 constexpr uint8_t PIN_RST = 4;    // SX1276 RESET
 constexpr uint8_t PIN_DIO0 = 26;  // SX1276 DIO0 (interrupt)
@@ -17,21 +22,58 @@ constexpr int LORA_TX_POWER = 2;           // dBm
 
 constexpr unsigned long PACKET_INTERVAL_MS = 5000;  // delay between packets
 
-static unsigned long messageCounter = 0;
+// RTC memory
+RTC_DATA_ATTR static uint32_t rtcMessageCounter = 0;
+RTC_DATA_ATTR static uint64_t rtcTimestampMs = 0;
+
+#define DEBUG
+
+#if defined(DEBUG)
+#define DBG_BEGIN(baud) Serial.begin(baud)
+#define DBG_PRINT(...) Serial.print(__VA_ARGS__)
+#define DBG_PRINTLN(...) Serial.println(__VA_ARGS__)
+
+constexpr uint8_t DBG_LED_PIN = 2;
+
+#define DBG_LED_INIT()                  \
+    do {                                \
+        pinMode(DBG_LED_PIN, OUTPUT);   \
+        digitalWrite(DBG_LED_PIN, LOW); \
+    } while (0)
+#define DBG_LED_ON() digitalWrite(DBG_LED_PIN, HIGH)
+#define DBG_LED_OFF() digitalWrite(DBG_LED_PIN, LOW)
+#else
+#define DBG_BEGIN(baud) (void)0
+#define DBG_PRINT(...) (void)0
+#define DBG_PRINTLN(...) (void)0
+#define DBG_LED_INIT() (void)0
+#define DBG_LED_ON() (void)0
+#define DBG_LED_OFF() (void)0
+#endif
+
+unsigned long sessionStartMs = 0;
 
 void setup() {
-    Serial.begin(115200);
-    while (!Serial) { /* wait for serial connection on some boards */
-    }
-    Serial.println("LoRa Sender Starting...");
+    DBG_BEGIN(115200);
+    sessionStartMs = millis();
+
+    DBG_PRINT("Current RTC Timestamp (ms): ");
+    DBG_PRINTLN(rtcTimestampMs + sessionStartMs);
+
+    DBG_LED_INIT();
+    DBG_PRINTLN("LoRa Sender Starting...");
 
     LoRa.setPins(PIN_SS, PIN_RST, PIN_DIO0);
+    // Disable WiFi and Bluetooth to save power
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    esp_bluedroid_disable();
+    esp_bt_controller_disable();
 
     if (!LoRa.begin(LORA_FREQUENCY)) {
-        Serial.println("Starting LoRa failed!");
-        while (true) {
-            delay(1000);
-        }
+        DBG_PRINTLN("Starting LoRa failed!");
+        esp_sleep_enable_timer_wakeup(PACKET_INTERVAL_MS * 1000ULL);
+        esp_deep_sleep_start();
     }
 
     LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
@@ -42,33 +84,44 @@ void setup() {
     LoRa.setTxPower(LORA_TX_POWER);
     LoRa.enableCrc();
 
-    Serial.println("LoRa started successfully.");
-}
+    DBG_PRINTLN("LoRa started successfully.");
 
-void sendLoRaMessage(const char* message) {
+    ++rtcMessageCounter;
+
+    const unsigned long timestampBeforeSend = static_cast<unsigned long>(rtcTimestampMs + millis());
+    const float sensorData = random(200, 300) / 10.0f;
+
+    // Build payload
+    char payload[64];
+    int n = snprintf(payload, sizeof(payload), "%lu|%lu|%.3f",
+                     rtcMessageCounter, timestampBeforeSend, sensorData);
+    if (n <= 0 || static_cast<size_t>(n) >= sizeof(payload)) {
+        DBG_PRINTLN("Payload formatting error");
+        // go to sleep and retry
+        esp_sleep_enable_timer_wakeup(PACKET_INTERVAL_MS * 1000ULL);
+        esp_deep_sleep_start();
+    }
+
+    // Send payload
+    DBG_LED_ON();
     LoRa.beginPacket();
-    LoRa.print(message);
+    LoRa.print(payload);
     LoRa.endPacket();
+    DBG_LED_OFF();
+    DBG_PRINT("Sent: ");
+    DBG_PRINTLN(payload);
+    DBG_PRINT("LoRa Tx time (ms): ");
+    DBG_PRINTLN(millis() - sessionStartMs);
+    LoRa.sleep();
+
+    rtcTimestampMs += PACKET_INTERVAL_MS + millis();
+
+    // Configure deep sleep for the requested interval (milliseconds -> microseconds)
+    esp_sleep_enable_timer_wakeup(PACKET_INTERVAL_MS * 1000ULL);
+    DBG_PRINTLN("Going to deep sleep...");
+    esp_deep_sleep_start();
 }
 
 void loop() {
-    ++messageCounter;
-    const unsigned long timestamp = millis();
-    const float sensorData = random(200, 300) / 10.0f;
-
-    // Use a stack buffer and snprintf to avoid heavy String concatenation
-    char payload[64];
-    int n = snprintf(payload, sizeof(payload), "%lu|%lu|%.3f",
-                     messageCounter, timestamp, sensorData);
-    if (n <= 0 || static_cast<size_t>(n) >= sizeof(payload)) {
-        Serial.println("Payload formatting error");
-        delay(PACKET_INTERVAL_MS);
-        return;
-    }
-
-    sendLoRaMessage(payload);
-    Serial.print("Sent: ");
-    Serial.println(payload);
-
-    delay(PACKET_INTERVAL_MS);
+    // not used: device sleeps between transmissions
 }
