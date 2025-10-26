@@ -18,7 +18,7 @@ constexpr long LORA_BANDWIDTH = 125E3;     // Hz
 constexpr int LORA_CODING_RATE4 = 8;       // 5..8 (represents 4/5..4/8 as 5..8)
 constexpr long LORA_PREAMBLE_LENGTH = 12;  // symbols
 constexpr uint8_t LORA_SYNC_WORD = 0x12;   // network sync word
-constexpr int LORA_TX_POWER = 2;           // dBm
+constexpr int LORA_TX_POWER = 20;          // dBm
 
 constexpr unsigned long PACKET_INTERVAL_MS = 5000;  // delay between packets
 
