@@ -11,16 +11,16 @@
 #include "soc/rtc.h"
 
 static esp_adc_cal_characteristics_t adc_chars;
-const adc1_channel_t ADC_CHANNEL = ADC1_CHANNEL_4;  // GPIO32 = ADC1_CH4
+constexpr adc1_channel_t ADC_CHANNEL = ADC1_CHANNEL_4;  // GPIO32 = ADC1_CH4
 
 // Battery measurement pins and constants
-const int PIN_GATE = 27;    // GPIO controlling MOSFET gate (BS170/IRLZ44N)
-const int PIN_ADC = 32;     // ESP32 ADC pin (ADC1_CH4)
-const float R1 = 300000.0;  // 300k ohm
-const float R2 = 120000.0;  // 120k ohm
-const float DIVIDER_RATIO = (R1 + R2) / R2;
-const int NUM_SAMPLES = 8;
-const float BATTERY_CALIBRATION_FACTOR = 0.979;
+constexpr int PIN_GATE = 27;    // GPIO controlling MOSFET gate (BS170/IRLZ44N)
+constexpr int PIN_ADC = 32;     // ESP32 ADC pin (ADC1_CH4)
+constexpr float R1 = 300000.0;  // 300k ohm
+constexpr float R2 = 120000.0;  // 120k ohm
+constexpr float DIVIDER_RATIO = (R1 + R2) / R2;
+constexpr int NUM_SAMPLES = 8;
+constexpr float BATTERY_CALIBRATION_FACTOR = 0.979;  // Based on internal pin resistance
 
 // LoRa pins
 constexpr uint8_t DBG_LED_PIN = 2;
@@ -32,6 +32,7 @@ constexpr uint8_t PIN_DIO0 = 15;  // SX1276 DIO0 (interrupt)
 constexpr int LOADCELL_DOUT_PIN = 16;
 constexpr int LOADCELL_SCK_PIN = 4;
 constexpr float WEIGHT_CALIBRATION_FACTOR = 1069.518;
+constexpr int SCALE_NUM_READINGS = 3;
 
 // LoRa transmission constants
 constexpr long LORA_FREQUENCY = 868E6;     // Hz
@@ -47,7 +48,6 @@ constexpr unsigned long PACKET_INTERVAL_MS = 60 * 1000;  // delay between packet
 // RTC memory
 RTC_DATA_ATTR static uint32_t rtcMessageCounter = 0;
 RTC_DATA_ATTR static uint64_t rtcTimestampMs = 0;
-RTC_DATA_ATTR static uint32_t txPower = 20;
 
 #define DEBUG
 
@@ -72,19 +72,104 @@ RTC_DATA_ATTR static uint32_t txPower = 20;
 #define DBG_LED_OFF() (void)0
 #endif
 
-unsigned long sessionStartMs = 0;
-
 HX711 scale;
 Preferences prefs;
 
+/**
+ * Initialize hardware: set CPU frequency and disable WiFi/Bluetooth to save power
+ */
+void initializeHardware() {
+    // Reduce CPU frequency to 80MHz to save power
+    rtc_cpu_freq_config_t config;
+    rtc_clk_cpu_freq_get_config(&config);
+    rtc_clk_cpu_freq_to_config(RTC_CPU_FREQ_80M, &config);
+    rtc_clk_cpu_freq_set_config_fast(&config);
+
+    // Disable WiFi and Bluetooth to save power
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    esp_bluedroid_disable();
+    esp_bt_controller_disable();
+    esp_bt_controller_deinit();
+    esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+}
+
+/**
+ * Initialize and configure LoRa module
+ * @return true if initialization successful, false otherwise
+ */
+bool initializeLoRa() {
+    DBG_PRINTLN("LoRa Sender Starting...");
+    LoRa.setPins(PIN_SS, PIN_RST, PIN_DIO0);
+
+    if (!LoRa.begin(LORA_FREQUENCY)) {
+        DBG_PRINTLN("Starting LoRa failed!");
+        return false;
+    }
+
+    LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
+    LoRa.setSignalBandwidth(LORA_BANDWIDTH);
+    LoRa.setCodingRate4(LORA_CODING_RATE4);
+    LoRa.setPreambleLength(LORA_PREAMBLE_LENGTH);
+    LoRa.setSyncWord(LORA_SYNC_WORD);
+    LoRa.setTxPower(LORA_TX_POWER);
+    LoRa.enableCrc();
+
+    DBG_PRINTLN("LoRa started successfully.");
+    return true;
+}
+
+/**
+ * Initialize HX711 load cell scale and restore tare offset from NVS
+ */
+void initializeScale() {
+    DBG_PRINTLN("Initializing the scale");
+    scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+    scale.set_scale(WEIGHT_CALIBRATION_FACTOR);
+
+    prefs.begin("scale", false);
+
+    // Restore tare if stored to avoid repeated taring on every boot
+    if (prefs.isKey("tare_val")) {
+        long savedTare = prefs.getLong("tare_val", 0L);
+        scale.set_offset(savedTare);
+        DBG_PRINT("Restored tare offset from NVS: ");
+        DBG_PRINTLN(savedTare);
+    } else {
+        // Perform initial tare and store it
+        scale.tare();
+        long offset = scale.get_offset();
+        prefs.putLong("tare_val", offset);
+        DBG_PRINT("Performed initial tare and stored offset: ");
+        DBG_PRINTLN(offset);
+    }
+
+    prefs.end();
+}
+
+/**
+ * Initialize ADC for battery voltage measurement
+ */
+void initializeBatteryADC() {
+    // Configure MOSFET gate pin
+    pinMode(PIN_GATE, OUTPUT);
+    digitalWrite(PIN_GATE, LOW);
+
+    // Configure ADC
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(ADC_CHANNEL, ADC_ATTEN_DB_2_5);
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_2_5, ADC_WIDTH_BIT_12, 1100, &adc_chars);
+}
+
 float readBatteryVoltage() {
+    // Turn on MOSFET to enable battery voltage measurement
     digitalWrite(PIN_GATE, HIGH);
-    delayMicroseconds(200);
+    delayMicroseconds(200);  // Wait for voltage to stabilize
 
     long adcSum = 0;
     for (int i = 0; i < NUM_SAMPLES; i++) {
         adcSum += adc1_get_raw(ADC_CHANNEL);
-        delayMicroseconds(100);
+        delayMicroseconds(100);  // Small delay between samples for stability
     }
     // Turn off MOSFET to save power
     digitalWrite(PIN_GATE, LOW);
@@ -96,6 +181,11 @@ float readBatteryVoltage() {
     return vBattery;
 }
 
+/*
+ * Calculate battery percentage from voltage using a 5th degree polynomial approximation
+ * @param voltage Battery voltage in volts
+ * @return Estimated battery percentage (0.0 to 100.0)
+ */
 float getBatteryPercentage(float voltage) {
     float result = 0.0;
     result += -21.407274 * pow(voltage, 5);
@@ -109,6 +199,11 @@ float getBatteryPercentage(float voltage) {
     return result;
 }
 
+/*
+ * Calculate battery percentage from voltage using lookup table and linear interpolation
+ * @param voltage Battery voltage in volts
+ * @return Estimated battery percentage (0.0 to 100.0)
+ */
 float getBatteryPercentageLookup(float voltage) {
     const int numPoints = 20;
     float voltages[20] = {4.11, 4.02, 3.94, 3.85, 3.77, 3.68, 3.60, 3.51, 3.43, 3.34, 3.26, 3.17, 3.09, 3.00, 2.92, 2.83, 2.75, 2.66, 2.58, 2.49};
@@ -125,114 +220,42 @@ float getBatteryPercentageLookup(float voltage) {
     return 0.0;
 }
 
-void setup() {
-    DBG_BEGIN(115200);
-    sessionStartMs = millis();
+/**
+ * Build the LoRa payload string
+ * @param buffer Output buffer for the payload
+ * @param bufferSize Size of the output buffer
+ * @param msgCount Message counter
+ * @param timestamp Timestamp in milliseconds
+ * @param weight Weight reading in grams
+ * @param voltage Battery voltage in volts
+ * @param batteryPct Battery percentage
+ * @return true if payload was built successfully, false on error
+ */
+bool buildPayload(char* buffer, size_t bufferSize,
+                  uint32_t msgCount, unsigned long timestamp,
+                  float weight, float voltage, float batteryPct) {
+    // Format: messageCounter|timestampMs|weight|batteryVoltage|batteryPercentage
+    int bytesWritten = snprintf(buffer, bufferSize, "%lu|%lu|%.3f|%.3f|%.2f",
+                                msgCount, timestamp, weight, voltage, batteryPct);
 
-    DBG_PRINT("Current RTC Timestamp (ms): ");
-    DBG_PRINTLN(rtcTimestampMs + sessionStartMs);
-
-    rtc_cpu_freq_config_t config;
-    rtc_clk_cpu_freq_get_config(&config);
-    rtc_clk_cpu_freq_to_config(RTC_CPU_FREQ_80M, &config);
-    rtc_clk_cpu_freq_set_config_fast(&config);
-
-    DBG_LED_INIT();
-    DBG_PRINTLN("LoRa Sender Starting...");
-
-    LoRa.setPins(PIN_SS, PIN_RST, PIN_DIO0);
-    // Disable WiFi and Bluetooth to save power
-    esp_wifi_stop();
-    esp_wifi_deinit();
-    esp_bluedroid_disable();
-    esp_bt_controller_disable();
-    esp_bt_controller_deinit();
-    esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
-
-    if (!LoRa.begin(LORA_FREQUENCY)) {
-        DBG_PRINTLN("Starting LoRa failed!");
-        esp_sleep_enable_timer_wakeup(PACKET_INTERVAL_MS * 1000ULL);
-        esp_deep_sleep_start();
-    }
-
-    LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
-    LoRa.setSignalBandwidth(LORA_BANDWIDTH);
-    LoRa.setCodingRate4(LORA_CODING_RATE4);
-    LoRa.setPreambleLength(LORA_PREAMBLE_LENGTH);
-    LoRa.setSyncWord(LORA_SYNC_WORD);
-    LoRa.setTxPower(txPower);
-    LoRa.enableCrc();
-
-    DBG_PRINTLN("LoRa started successfully.");
-
-    DBG_PRINTLN("Initializing the scale");
-    scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
-    scale.set_scale(WEIGHT_CALIBRATION_FACTOR);
-
-    prefs.begin("scale", false);
-    // restore tare if stored to avoid repeated taring on every boot
-    if (prefs.isKey("tare_val")) {
-        long savedTare = prefs.getLong("tare_val", 0L);
-        scale.set_offset(savedTare);
-        DBG_PRINT("Restored tare offset from NVS: ");
-        DBG_PRINTLN(savedTare);
-    } else {
-        // perform initial tare and store it
-        scale.tare();
-        long offs = scale.get_offset();
-        prefs.putLong("tare_val", offs);
-        DBG_PRINT("Performed initial tare and stored offset: ");
-        DBG_PRINTLN(offs);
-    }
-    prefs.end();
-
-    // Prepare ADC for battery voltage measurement
-    pinMode(PIN_GATE, OUTPUT);
-    digitalWrite(PIN_GATE, LOW);
-
-    adc1_config_width(ADC_WIDTH_BIT_12);
-    adc1_config_channel_atten(ADC_CHANNEL, ADC_ATTEN_DB_2_5);
-    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_2_5, ADC_WIDTH_BIT_12, 1100, &adc_chars);
-
-    float batteryVoltage = readBatteryVoltage();
-    float batteryPercentage = getBatteryPercentage(batteryVoltage);
-    DBG_PRINT("Battery Voltage (V): ");
-    DBG_PRINTLN(batteryVoltage);
-
-    DBG_PRINT("BatteryPercent: ");
-    DBG_PRINT(batteryPercentage, 1);
-    DBG_PRINTLN("%");
-
-    DBG_LED_ON();
-    float weight = scale.get_units(3);
-
-    DBG_PRINT("Weight reading (g): ");
-    DBG_PRINTLN(weight);
-    DBG_LED_OFF();
-
-    DBG_PRINT("Weigh time (ms): ");
-    DBG_PRINTLN(millis() - sessionStartMs);
-    scale.power_down();
-
-    ++rtcMessageCounter;
-
-    const unsigned long beforeSendMillis = millis();
-    const unsigned long timestampBeforeSend = static_cast<unsigned long>(rtcTimestampMs + beforeSendMillis);
-
-    // Build payload: messageCounter|timestampMs|weight|batteryVoltage|batteryPercentage
-    char payload[64];
-    int n = snprintf(payload, sizeof(payload), "%lu|%lu|%.3f|%.3f|%.2f",
-                     rtcMessageCounter, timestampBeforeSend, weight, batteryVoltage, batteryPercentage);
-    if (n <= 0 || static_cast<size_t>(n) >= sizeof(payload)) {
+    if (bytesWritten <= 0 || static_cast<size_t>(bytesWritten) >= bufferSize) {
         DBG_PRINTLN("Payload formatting error");
-        // go to sleep and retry
-        esp_sleep_enable_timer_wakeup(PACKET_INTERVAL_MS * 1000ULL);
-        esp_deep_sleep_start();
+        return false;
     }
 
-    // Send payload
+    return true;
+}
+
+/**
+ * Send a LoRa packet with the given payload
+ * @param payload Null-terminated string to send
+ */
+void sendLoRaPacket(const char* payload) {
+    const unsigned long beforeSendMillis = millis();
+
     DBG_PRINTLN("Sending LoRa packet...");
     DBG_LED_ON();
+
     LoRa.beginPacket();
     LoRa.print(payload);
     LoRa.endPacket();
@@ -242,17 +265,81 @@ void setup() {
     DBG_PRINTLN(payload);
     DBG_PRINT("LoRa Tx time (ms): ");
     DBG_PRINTLN(millis() - beforeSendMillis);
-    DBG_PRINT("txPower: ");
-    DBG_PRINTLN(txPower);
+
     LoRa.sleep();
+}
 
-    rtcTimestampMs += PACKET_INTERVAL_MS + millis();
-
+/**
+ * Enter deep sleep mode for the specified interval
+ * @param intervalMs Sleep duration in milliseconds
+ */
+void enterDeepSleep(unsigned long intervalMs) {
     DBG_PRINTLN("Going to deep sleep...");
-    // Configure deep sleep for the requested interval (milliseconds -> microseconds)
-    esp_sleep_enable_timer_wakeup(PACKET_INTERVAL_MS * 1000ULL);
+    // Configure deep sleep timer (milliseconds -> microseconds)
+    esp_sleep_enable_timer_wakeup(intervalMs * 1000ULL);
     esp_deep_sleep_start();
 }
 
+void setup() {
+    DBG_BEGIN(115200);
+    unsigned long sessionStartMs = millis();
+
+    DBG_PRINT("Current RTC Timestamp (ms): ");
+    DBG_PRINTLN(rtcTimestampMs + sessionStartMs);
+
+    DBG_LED_INIT();
+
+    // Initialize all hardware subsystems
+    initializeHardware();
+
+    if (!initializeLoRa()) {
+        // LoRa failed to start, sleep and retry later
+        enterDeepSleep(PACKET_INTERVAL_MS);
+    }
+
+    initializeScale();
+    initializeBatteryADC();
+
+    // Read battery status
+    float batteryVoltage = readBatteryVoltage();
+    float batteryPercentage = getBatteryPercentage(batteryVoltage);
+    DBG_PRINT("Battery Voltage (V): ");
+    DBG_PRINTLN(batteryVoltage);
+    DBG_PRINT("BatteryPercent: ");
+    DBG_PRINT(batteryPercentage, 1);
+    DBG_PRINTLN("%");
+
+    // Read weight from scale
+    DBG_LED_ON();
+    float weight = scale.get_units(SCALE_NUM_READINGS);
+    DBG_PRINT("Weight reading (g): ");
+    DBG_PRINTLN(weight);
+    DBG_LED_OFF();
+
+    DBG_PRINT("Weigh time (ms): ");
+    DBG_PRINTLN(millis() - sessionStartMs);
+    scale.power_down();
+
+    // Prepare data for transmission
+    ++rtcMessageCounter;
+    const unsigned long currentTimestamp = static_cast<unsigned long>(rtcTimestampMs + millis());
+
+    // Build and send payload
+    char payload[64];
+    if (!buildPayload(payload, sizeof(payload),
+                      rtcMessageCounter, currentTimestamp,
+                      weight, batteryVoltage, batteryPercentage)) {
+        // Payload formatting failed, sleep and retry
+        enterDeepSleep(PACKET_INTERVAL_MS);
+    }
+
+    sendLoRaPacket(payload);
+
+    // Update timestamp and enter deep sleep
+    rtcTimestampMs += PACKET_INTERVAL_MS + millis();
+    enterDeepSleep(PACKET_INTERVAL_MS);
+}
+
 void loop() {
+    // Not used in deep sleep mode
 }
